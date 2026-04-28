@@ -1,149 +1,237 @@
 """Independent summary plot for categorical data distribution."""
+from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 import matplotlib.pyplot as plt
 import pandas as pd
 from matplotlib import colors as mcolors
 
 
+# ── Shared colour utility ───────────────────────────────────
+
+
+def is_light_color(color: str) -> bool:
+    """Return *True* when overlaid text should be black (light background)."""
+    r, g, b = mcolors.to_rgb(color)
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b > 0.7
+
+
+# ── Result dataclass ────────────────────────────────────────
+
+
+@dataclass
+class SummaryPlotResult:
+    """Return value of :meth:`SummaryPlot.plot`."""
+
+    ax: plt.Axes
+    category_percentages: pd.Series
+
+
+# ── Main class ──────────────────────────────────────────────
+
+
 class SummaryPlot:
     """
-    An independent class to generate a horizontal stacked summary bar chart
-    for thermal comfort categories. This decouples the summary visualization
-    from the RangeScene base map, offering maximum flexibility to the user.
+    Stacked bar chart for categorical data distribution.
+
+    Supports both horizontal (default) and vertical orientation.
     """
 
-    def __init__(self, data: pd.DataFrame):
+    def __init__(
+        self,
+        data: pd.DataFrame,
+        *,
+        target_column: str | None = None,
+        bins: Sequence[float] | None = None,
+        labels: Sequence[str] | None = None,
+        colors: Sequence[str] | None = None,
+        orientation: str | None = None,
+    ) -> None:
         if not isinstance(data, pd.DataFrame):
-            raise TypeError("Data must be a pandas DataFrame.")
-        self.data = data.copy()
+            raise TypeError("data must be a pandas DataFrame.")
+        self._data = data
+        self._target_column = target_column
+        self._bins = list(bins) if bins is not None else None
+        self._labels = list(labels) if labels is not None else None
+        self._colors = list(colors) if colors is not None else None
+        self._orientation = orientation
+        self._last_result: SummaryPlotResult | None = None
 
-    def _is_light_color(self, color: str) -> bool:
-        """
-        Calculate luminance to determine if the overlaid text should be
-        black or white to maintain optimal contrast.
-        """
-        red, green, blue = mcolors.to_rgb(color)
-        luminance = 0.2126 * red + 0.7152 * green + 0.0722 * blue
-        return luminance > 0.7
+    # ── Data management ─────────────────────────────────────
+
+    def update(self, data: pd.DataFrame) -> SummaryPlot:
+        """Replace the source data.  Returns *self* for chaining."""
+        if not isinstance(data, pd.DataFrame):
+            raise TypeError("data must be a pandas DataFrame.")
+        self._data = data
+        self._last_result = None
+        return self
+
+    @property
+    def last_result(self) -> SummaryPlotResult | None:
+        """The result from the most recent ``plot()`` call, or *None*."""
+        return self._last_result
+
+    # ── Public API ──────────────────────────────────────────
 
     def plot(
         self,
-        target_column: str,
-        bins: Sequence[float],
-        labels: Sequence[str],
-        colors: Sequence[str],
+        target_column: str | None = None,
+        bins: Sequence[float] | None = None,
+        labels: Sequence[str] | None = None,
+        colors: Sequence[str] | None = None,
         ax: plt.Axes | None = None,
         title: str | None = "Category Distribution",
         show_percentages: bool = True,
-    ) -> plt.Axes:
+        orientation: str | None = None,
+    ) -> SummaryPlotResult:
         """
-        Generates the single stacked horizontal bar chart.
+        Render a stacked bar chart.
 
         Parameters
         ----------
-        target_column : str
-            The column in the dataframe to be categorized (e.g., 'pmv').
-        bins : Sequence[float]
-            The thresholds for categorization.
-        labels : Sequence[str]
-            The category names corresponding to the bins.
-        colors : Sequence[str]
-            The colors assigned to each category.
-        ax : plt.Axes | None, optional
-            A matplotlib axes object to plot on. If None, a new one is created.
-        title : str | None, optional
-            The title of the plot. Set to None to hide the title.
-        show_percentages : bool, optional
-            Whether to display the percentage text inside the bars.
+        orientation : "horizontal" or "vertical" or None
+            None falls back to the value stored in ``__init__``,
+            then to ``"horizontal"``.
         """
+        # Resolve: param → stored → default
+        tc = target_column or self._target_column
+        b = list(bins) if bins is not None else self._bins
+        lb = list(labels) if labels is not None else self._labels
+        cl = list(colors) if colors is not None else self._colors
+        ori = orientation or self._orientation or "horizontal"
 
-        if target_column not in self.data.columns:
-            raise ValueError(f"Column '{target_column}' not found in dataframe.")
+        if tc is None:
+            raise ValueError(
+                "target_column must be provided in __init__() or plot()."
+            )
+        if b is None or lb is None or cl is None:
+            raise ValueError(
+                "bins, labels, and colors must all be provided "
+                "in __init__() or plot()."
+            )
+        if tc not in self._data.columns:
+            raise ValueError(f"Column '{tc}' not found in dataframe.")
+        if ori not in ("horizontal", "vertical"):
+            raise ValueError(
+                f"orientation must be 'horizontal' or 'vertical', got '{ori}'."
+            )
 
         if ax is None:
-            # Use a wide but flat figure size specifically for a single horizontal bar
-            _, ax = plt.subplots(figsize=(8, 2))
+            figsize = (8, 2) if ori == "horizontal" else (2.5, 6)
+            _, ax = plt.subplots(figsize=figsize)
 
-        # 1. Categorize the data based on the provided bins
-        self.data["category"] = pd.cut(
-            self.data[target_column],
-            bins=bins,
-            labels=labels,
-            right=False,
+        # Categorize — local Series, self._data is never mutated
+        categories = pd.cut(
+            self._data[tc], bins=b, labels=lb, right=False,
         )
-
-        # 2. Calculate category percentages
         pct = (
-            self.data["category"]
-            .value_counts(normalize=True)
-            .reindex(labels)
+            categories.value_counts(normalize=True)
+            .reindex(lb)
             .fillna(0.0)
             * 100
         )
 
-        # 3. Canvas cleanup (Minimalist aesthetic without spines and ticks)
+        if ori == "horizontal":
+            self._setup_axes_h(ax, title)
+            self._render_bar_h(ax, pct, lb, cl, show_percentages)
+        else:
+            self._setup_axes_v(ax, title)
+            self._render_bar_v(ax, pct, lb, cl, show_percentages)
+
+        result = SummaryPlotResult(ax=ax, category_percentages=pct)
+        self._last_result = result
+        return result
+
+    # ── Horizontal rendering ────────────────────────────────
+
+    @staticmethod
+    def _setup_axes_h(ax: plt.Axes, title: str | None) -> None:
         if title:
             ax.set_title(title, fontsize=13, pad=10)
-
         ax.set_xlim(0, 100)
         ax.set_ylim(-0.6, 0.6)
         ax.set_xticks([])
         ax.set_yticks([])
-
         for spine in ax.spines.values():
             spine.set_visible(False)
 
-        # 4. Render the horizontal stacked bar
-        left_pos = 0.0
-        bar_y = 0.0
-        bar_height = 0.4
+    @staticmethod
+    def _render_bar_h(
+        ax: plt.Axes,
+        pct: pd.Series,
+        labels: Sequence[str],
+        colors: Sequence[str],
+        show_percentages: bool,
+    ) -> None:
+        left = 0.0
+        bar_y, bar_h = 0.0, 0.4
 
-        for i, category in enumerate(labels):
-            value = float(pct[category])
-            color = colors[i]
-
-            # Render the colored segment for the current category
+        for label, color in zip(labels, colors):
+            value = float(pct[label])
             ax.barh(
-                y=bar_y,
-                width=value,
-                left=left_pos,
-                height=bar_height,
-                color=color,
-                edgecolor="white",
-                linewidth=1.0,
+                y=bar_y, width=value, left=left, height=bar_h,
+                color=color, edgecolor="white", linewidth=1.0,
             )
-
-            # Add annotations only if the category has data points
             if value > 0:
-                # 5. Render percentage text (if requested)
                 if show_percentages:
-                    text_color = "black" if self._is_light_color(color) else "white"
+                    tc = "black" if is_light_color(color) else "white"
                     ax.text(
-                        left_pos + value / 2,
-                        bar_y,
-                        f"{value:.1f}%",
-                        ha="center",
-                        va="center",
-                        fontsize=12,
-                        fontweight="bold",
-                        color=text_color,
+                        left + value / 2, bar_y, f"{value:.1f}%",
+                        ha="center", va="center",
+                        fontsize=12, fontweight="bold", color=tc,
                     )
-
-                # 6. Render category label beneath the segment
-                label_color = "dimgray" if self._is_light_color(color) else color
+                lc = "dimgray" if is_light_color(color) else color
                 ax.text(
-                    left_pos + value / 2,
-                    bar_y - 0.28,
-                    category,
-                    ha="center",
-                    va="top",
-                    fontsize=11,
-                    color=label_color,
+                    left + value / 2, bar_y - 0.28, label,
+                    ha="center", va="top", fontsize=11, color=lc,
                 )
+            left += value
 
-            # Shift the starting position for the next segment
-            left_pos += value
+    # ── Vertical rendering ──────────────────────────────────
 
-        return ax
+    @staticmethod
+    def _setup_axes_v(ax: plt.Axes, title: str | None) -> None:
+        if title:
+            ax.set_title(title, fontsize=11, pad=8)
+        ax.set_xlim(-0.5, 0.9)
+        ax.set_ylim(0, 100)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+
+    @staticmethod
+    def _render_bar_v(
+        ax: plt.Axes,
+        pct: pd.Series,
+        labels: Sequence[str],
+        colors: Sequence[str],
+        show_percentages: bool,
+    ) -> None:
+        bottom = 0.0
+        bar_x, bar_w = 0.0, 0.4
+
+        for label, color in zip(labels, colors):
+            value = float(pct[label])
+            ax.bar(
+                x=bar_x, height=value, bottom=bottom, width=bar_w,
+                color=color, edgecolor="white", linewidth=1.0,
+            )
+            if value > 0:
+                if show_percentages:
+                    tc = "black" if is_light_color(color) else "white"
+                    ax.text(
+                        bar_x, bottom + value / 2, f"{value:.1f}%",
+                        ha="center", va="center",
+                        fontsize=10, fontweight="bold", color=tc,
+                        rotation=90,
+                    )
+                lc = "dimgray" if is_light_color(color) else color
+                ax.text(
+                    bar_x + 0.30, bottom + value / 2, label,
+                    ha="left", va="center", fontsize=9, color=lc,
+                )
+            bottom += value
